@@ -1,0 +1,67 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve Forgejo on the home network
+        env:
+          HOME_FORGEJO_IP: ${{ vars.HOME_FORGEJO_IP }}
+        run: |
+          test -n "$HOME_FORGEJO_IP"
+          printf '%s forgejo.romaine.life\n' "$HOME_FORGEJO_IP" | sudo tee -a /etc/hosts >/dev/null
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check committed whitespace
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ -n "$BASE" ] && git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            git diff --check "$BASE" HEAD
+          else
+            git show --format= --check HEAD
+          fi
+      - name: Validate Markdown
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import re
+          import subprocess
+          from urllib.parse import unquote, urlsplit
+
+          paths = subprocess.check_output(['git', 'ls-files', '*.md'], text=True).splitlines()
+          if not paths:
+              raise SystemExit('No Markdown files found')
+          for name in paths:
+              path = pathlib.Path(name)
+              text = path.read_bytes().decode('utf-8')
+              if '\ufffd' in text or any(ord(c) < 32 and c not in '\n\r\t' for c in text):
+                  raise SystemExit(f'{name}: invalid text character')
+              if not text.endswith('\n'):
+                  raise SystemExit(f'{name}: missing final newline')
+              fence = None
+              for line in text.splitlines():
+                  match = re.match(r'^\s{0,3}(`{3,}|~{3,})', line)
+                  if match:
+                      marker = match.group(1)
+                      if fence is None:
+                          fence = marker
+                      elif marker[0] == fence[0] and len(marker) >= len(fence):
+                          fence = None
+                      continue
+                  if fence is None:
+                      for target in re.findall(r'(?<!!)\[[^]]+\]\(([^\s)]+)', line):
+                          url = urlsplit(target)
+                          if not url.scheme and not url.netloc and url.path:
+                              if not (path.parent / unquote(url.path)).exists():
+                                  raise SystemExit(f'{name}: missing local link {target}')
+              if fence:
+                  raise SystemExit(f'{name}: unclosed code fence')
+          print(f'Validated {len(paths)} Markdown file(s)')
+          PY
